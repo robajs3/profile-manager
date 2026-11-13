@@ -22,6 +22,7 @@ ERRORS = {
     "profile_too_large": "Profil przekracza limit rozmiaru na serwerze.", "quota_exceeded": "Przekroczono limit miejsca na serwerze.",
     "profile_limit_reached": "Osiągnięto limit liczby profili.", "no_server": "Nie podano adresu serwera.",
     "revision_conflict": "Konflikt wersji: na serwerze jest nowsza wersja profilu.",
+    "lock_required": "Serwer nie widzi Twojej blokady na tym profilu (wygasła podczas wysyłki). Dane lokalne są bezpieczne, spróbuj ponownie.",
     "lock_lost": "Utracono blokadę profilu (serwer przejął ją po przerwie w łączności).",
     "checksum_mismatch": "Pobrany profil jest uszkodzony (zła suma kontrolna).",
 }
@@ -293,6 +294,7 @@ class MainWindow(QMainWindow):
         self.pending: dict[str, str] = {}       # id -> komunikat (czeka na wysyłkę)
         self.busy: set[str] = set()
         self.pending_hb: dict[str, float] = {}
+        self.finishing: set[str] = set()
         self._tasks: list[Task] = []
         self.browser_ready = False
 
@@ -537,7 +539,7 @@ class MainWindow(QMainWindow):
             elif now - r["last_hb"] > 30:
                 r["last_hb"] = now
                 self.heartbeat(pid)
-        for pid in list(self.pending):
+        for pid in set(self.pending) | self.finishing:
             if now - self.pending_hb.get(pid, 0) > 30:
                 self.pending_hb[pid] = now
                 self.heartbeat(pid)
@@ -551,12 +553,12 @@ class MainWindow(QMainWindow):
         self._tasks.append(t); t.start()
 
     def retry_finish(self, pid):
-        self.busy.add(pid); self.pending.pop(pid, None); self.fill()
+        self.busy.add(pid); self.finishing.add(pid); self.pending.pop(pid, None); self.fill()
         def ok(_):
-            self.busy.discard(pid); self.pending.pop(pid, None); self.refresh()
+            self.finishing.discard(pid); self.busy.discard(pid); self.pending.pop(pid, None); self.refresh()
             self.statusBar().showMessage("Profil zsynchronizowany.")
         def bad(e):
-            self.busy.discard(pid)
+            self.finishing.discard(pid); self.busy.discard(pid)
             self.pending[pid] = err_text(e)
             self.fill()
             self.statusBar().showMessage("Nie udało się wysłać profilu. Kliknij Uruchom na tym profilu, aby ponowić.")

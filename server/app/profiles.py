@@ -66,7 +66,9 @@ def own(db: Session, user: User, pid: str) -> Profile:
 
 
 def require_holder(p: Profile, device_id: str):
-    if not lock_active(p) or p.lock_device_id != device_id:
+    # Blokada, która wygasła, ale której nikt nie przejął, nadal należy do tego urządzenia
+    # (przejęcie przez inne urządzenie zmienia lock_device_id i wtedy odrzucamy).
+    if p.lock_device_id != device_id:
         raise HTTPException(409, {"code": "lock_required"})
 
 
@@ -182,6 +184,8 @@ async def upload(pid: str, request: Request, x_device_id: str = Header(), x_base
     require_holder(p, x_device_id)
     if x_base_revision != p.revision:
         raise HTTPException(409, {"code": "revision_conflict", "server_revision": p.revision})
+    p.lock_expires_at = utcnow() + timedelta(seconds=settings.lease_ttl_seconds)
+    db.commit()
     cl = request.headers.get("content-length")
     if cl and int(cl) > MAX_BYTES:
         raise HTTPException(413, "profile_too_large")

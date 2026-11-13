@@ -63,5 +63,15 @@ expect("upload bez blokady", "lock_required", lambda: A.upload(pid, tmp / "x", 1
 (d / "cookies.sqlite").write_bytes(b"nowe-cookies-z-B")
 sync.finish(B, pid, nop); assert core.load_meta(pid)["revision"] == 2; print("ok   B wysłał rewizję 2")
 A.lock(pid); expect("upload ze starej rewizji", "revision_conflict", lambda: A.upload(pid, tmp / "x", 1)); print("ok   A znów może zająć profil")
+from datetime import datetime, timedelta, timezone
+from app.models import Profile, SessionLocal
+with SessionLocal() as db:
+    pr = db.get(Profile, pid); pr.lock_expires_at = datetime.now(timezone.utc) - timedelta(seconds=300); db.commit()
+(tmp / "y").write_bytes(b"2")
+assert A.upload(pid, tmp / "y", 2)["revision"] == 3; print("ok   upload po wygaśnięciu własnej blokady (nikt jej nie przejął)")
+with SessionLocal() as db:
+    pr = db.get(Profile, pid); pr.lock_expires_at = datetime.now(timezone.utc) - timedelta(seconds=300); db.commit()
+B.lock(pid)
+expect("A po przejęciu blokady przez B", "lock_required", lambda: A.upload(pid, tmp / "y", 3))
 print("\nWSZYSTKO OK")
 os._exit(0)
