@@ -101,7 +101,7 @@ def totp_setup(user: User = Depends(current_user), db: Session = Depends(get_db)
         raise HTTPException(400, "totp_already_enabled")
     user.totp_secret = pyotp.random_base32()
     db.commit()
-    uri = pyotp.TOTP(user.totp_secret).provisioning_uri(user.username, issuer_name=settings.server_name)
+    uri = pyotp.TOTP(user.totp_secret).provisioning_uri(name=user.username, issuer_name=settings.server_name)
     return {"secret": user.totp_secret, "uri": uri}
 
 

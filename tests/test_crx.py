@@ -34,14 +34,14 @@ assert crx_parse(Z) == (Z, None)
 from pm import addons
 tmp = Path(tempfile.mkdtemp())
 (tmp / "ext.crx").write_bytes(crx3)
-r = addons.install_from_file(tmp / "ext.crx", "chrome")
+r = addons.install_from_file(tmp / "ext.crx")
 assert r["slug"] == addons.ext_id_from_key(pub) and len(r["slug"]) == 32, r
 import json
-mf = json.loads((addons.path(r["slug"], "chrome") / "manifest.json").read_text())
+mf = json.loads((addons.path(r["slug"]) / "manifest.json").read_text())
 assert mf["key"], "brak key w manifeście (ID nie byłoby stałe)"
 folder = tmp / "Extensions" / ("a" * 32) / "1.0_0"; folder.mkdir(parents=True)
 (folder / "manifest.json").write_text('{"name":"Folderowy","version":"2"}'); (folder / "_metadata").mkdir(); (folder / "_metadata" / "verified_contents.json").write_text("{}")
-r2 = addons.install_from_file(folder, "chrome"); assert r2["slug"] == "a" * 32 and r2["name"] == "Folderowy", r2
-assert not (addons.path("a" * 32, "chrome") / "_metadata").exists(), "_metadata nie usunięty"
-assert {a["slug"] for a in addons.installed("chrome")} == {r["slug"], "a" * 32}
+r2 = addons.install_from_file(folder); assert r2["slug"] == "a" * 32 and r2["name"] == "Folderowy", r2
+assert not (addons.path("a" * 32) / "_metadata").exists(), "_metadata nie usunięty"
+assert {a["slug"] for a in addons.installed()} == {r["slug"], "a" * 32}
 print("CRX OK (parser + instalacja z pliku i z folderu)")

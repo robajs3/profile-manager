@@ -4,9 +4,7 @@ py -3.12 -m venv .venv || goto :err
 call .venv\Scripts\activate || goto :err
 pip install -r requirements.txt pyinstaller || goto :err
 pyinstaller --noconfirm --clean --onedir --windowed --name ProfileManager ^
-  --collect-all camoufox --collect-all playwright --collect-all fpgen ^
-  --collect-all browserforge --collect-all language_tags --collect-all screeninfo ^
-  --collect-all ua_parser --collect-all qrcode --hidden-import PIL ^
+  --collect-all playwright --collect-all qrcode --hidden-import PIL ^
   main.py || goto :err
 echo.
 echo Gotowe: dist\ProfileManager\ProfileManager.exe

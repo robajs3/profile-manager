@@ -1,5 +1,5 @@
 PySide6>=6.7
 requests>=2.32
-camoufox==0.5.9
+playwright>=1.49
 qrcode[pil]>=7.4
 truststore>=0.9

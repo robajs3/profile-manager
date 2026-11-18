@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import random
+import re
 import shutil
 import threading
 import uuid
@@ -12,21 +13,35 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("APPDATA") or Path.home() / ".config") / "ProfileManager"
 PROFILES = ROOT / "profiles"
-ADDONS = ROOT / "addons"                 # rozszerzenia Firefox (AMO)
 ADDONS_CHROME = ROOT / "addons_chrome"   # rozszerzenia Chrome (CRX rozpakowane)
 LOGS = ROOT / "logs"
 TMP = ROOT / "tmp"
 SETTINGS_FILE = ROOT / "settings.json"
-for _d in (PROFILES, ADDONS, ADDONS_CHROME, LOGS, TMP):
+for _d in (PROFILES, ADDONS_CHROME, LOGS, TMP):
     _d.mkdir(parents=True, exist_ok=True)
 
-ENGINES = {"firefox": "Firefox (Camoufox)", "chrome": "Chrome (fingerprint-chromium)"}
+ENGINES = {"chrome": "Chrome (fingerprint-chromium)"}   # Firefox (Camoufox) został usunięty z aplikacji
 
 DEFAULT_CONFIG = {
-    "engine": "firefox", "fp_seed": 0, "os": "windows", "locale": "", "timezone": "", "start_url": "about:blank",
-    "block_webrtc": False, "humanize": False, "ublock": False,
-    "addons": [], "sync": True, "notes": "",
+    "engine": "chrome", "fp_seed": 0, "locale": "", "timezone": "", "start_url": "about:blank",
+    "block_webrtc": False, "addons": [], "bookmarks": [], "sync": True, "notes": "",
 }
+
+_SCHEME = re.compile(r"^(?:[a-z][a-z0-9+.\-]*://|(?:about|chrome|chrome-extension|file|data|view-source|javascript):)", re.I)
+
+_LOCAL = re.compile(r"^(localhost|\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\])(?=[:/?#]|$)", re.I)   # jak omnibox Chrome: lokalne adresy po http
+
+
+def normalize_url(text: str) -> str:
+    """Dopisuje https://, jeśli adres nie ma schematu (np. `example.com` -> `https://example.com`).
+    Playwright odrzuca adresy bez schematu błędem „Cannot navigate to invalid URL”."""
+    text = (text or "").strip()
+    if not text or text == "about:blank":
+        return text
+    if _SCHEME.match(text):
+        return text
+    text = text.lstrip("/")
+    return ("http://" if _LOCAL.match(text) else "https://") + text
 
 
 def load_settings() -> dict:
@@ -45,18 +60,9 @@ def save_settings(s: dict):
     SETTINGS_FILE.write_text(json.dumps(s, indent=2), "utf-8")
 
 
-# ---------- fingerprint (400 kB JSON -> gzip+base64, żeby tanio trzymać go na serwerze) ----------
+# ---------- fingerprint (serwer wymaga pola; dla Chrome to tylko znacznik, właściwy seed jest w configu) ----------
 def encode_fp(fp: dict) -> str:
     return base64.b64encode(gzip.compress(json.dumps(fp).encode(), 6)).decode()
-
-
-def decode_fp(s: str) -> dict:
-    return json.loads(gzip.decompress(base64.b64decode(s)))
-
-
-def generate_fp(os_name: str) -> dict:
-    from camoufox.fingerprints import generate_fingerprint
-    return generate_fingerprint(os=os_name)
 
 
 # ---------- profile lokalne ----------
@@ -121,11 +127,9 @@ def write_fp_encoded(pid: str, s: str):
 def create_local(name: str, config: dict) -> dict:
     pid = str(uuid.uuid4())
     cfg = {**DEFAULT_CONFIG, **config}
-    if cfg["engine"] == "chrome":   # seed fingerprintu leży w configu profilu, więc synchronizuje się z serwerem
-        cfg["fp_seed"] = cfg.get("fp_seed") or random.randint(100000, 2**31 - 1)
-        write_fp_encoded(pid, encode_fp({"engine": "chrome"}))
-    else:
-        write_fp_encoded(pid, encode_fp(generate_fp(cfg["os"])))
+    cfg["engine"] = "chrome"
+    cfg["fp_seed"] = cfg.get("fp_seed") or random.randint(100000, 2**31 - 1)   # seed leży w configu, więc synchronizuje się z serwerem
+    write_fp_encoded(pid, encode_fp({"engine": "chrome"}))
     meta = {"id": pid, "name": name, "config": cfg, "revision": 0, "dirty": False}
     save_meta(meta)
     return meta

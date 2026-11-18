@@ -1,4 +1,4 @@
-"""Biblioteka rozszerzeń: Firefox (addons.mozilla.org) i Chrome (Chrome Web Store, CRX)."""
+"""Biblioteka rozszerzeń Chrome (Chrome Web Store, CRX). Biblioteka jest pusta, dopóki sam czegoś nie dodasz."""
 import base64
 import hashlib
 import io
@@ -11,40 +11,25 @@ import requests
 
 from . import core
 
-AMO_API = "https://addons.mozilla.org/api/v5/addons/addon/{}/?lang=en-US"
 CWS_CRX = ("https://clients2.google.com/service/update2/crx?response=redirect&os=win&arch=x64&os_arch=x86_64"
            "&nacl_arch=x86-64&prod=chromiumcrx&prodchannel=&prodversion=150.0.0.0&lang=en-US"
            "&acceptformat=crx2,crx3&x=id%3D{}%26installsource%3Dondemand%26uc")
 
-PRESETS = {
-    "firefox": {"Browsec": "browsec", "Steam Inventory Helper": "steam-inventory-helper"},
-    "chrome": {"Browsec": "omghfjlpggmjjaagoclmmobgdodcjboh",
-               "Steam Inventory Helper": "cmeakgjggjdlcpncigglobpjbkabhmjl"},
-}
+
+def parse_ref(text: str) -> str:
+    m = re.search(r"[a-p]{32}", text.strip())
+    if not m:
+        raise RuntimeError("Podaj 32-znakowe ID rozszerzenia albo link z Chrome Web Store")
+    return m.group(0)
 
 
-def _root(engine: str):
-    return core.ADDONS_CHROME if engine == "chrome" else core.ADDONS
+def path(slug: str):
+    return core.ADDONS_CHROME / slug
 
 
-def parse_ref(text: str, engine: str = "firefox") -> str:
-    text = text.strip()
-    if engine == "chrome":
-        m = re.search(r"[a-p]{32}", text)
-        if not m:
-            raise RuntimeError("Podaj 32-znakowe ID rozszerzenia albo link z Chrome Web Store")
-        return m.group(0)
-    m = re.search(r"/addon/([^/?#]+)", text)
-    return (m.group(1) if m else text).strip("/")
-
-
-def path(slug: str, engine: str = "firefox"):
-    return _root(engine) / slug
-
-
-def installed(engine: str = "firefox") -> list[dict]:
+def installed() -> list[dict]:
     out = []
-    for d in sorted(_root(engine).iterdir()):
+    for d in sorted(core.ADDONS_CHROME.iterdir()):
         f = d / ".pm.json"
         if f.exists():
             try:
@@ -54,41 +39,11 @@ def installed(engine: str = "firefox") -> list[dict]:
     return out
 
 
-def _swap_in(engine, slug, staging, name, ver):
+def _swap_in(slug, staging, name, ver):
     (staging / ".pm.json").write_text(json.dumps({"name": name, "version": ver}), "utf-8")
-    target = path(slug, engine)
+    target = path(slug)
     shutil.rmtree(target, ignore_errors=True)
     staging.rename(target)
-
-
-# ------------------------------------------------------------------ Firefox
-def install_firefox(slug: str, progress) -> dict:
-    progress(f"Szukam {slug} na AMO…", -1)
-    r = requests.get(AMO_API.format(slug), timeout=20)
-    if r.status_code == 404:
-        raise RuntimeError(f"Nie znaleziono dodatku „{slug}” na addons.mozilla.org")
-    r.raise_for_status()
-    j = r.json()
-    ver, url = j["current_version"]["version"], j["current_version"]["file"]["url"]
-    name = j["name"] if isinstance(j["name"], str) else next(iter(j["name"].values()))
-    tmp = core.TMP / f"{slug}.xpi"
-    with requests.get(url, stream=True, timeout=(10, 120)) as dl:
-        dl.raise_for_status()
-        total, done = int(dl.headers.get("Content-Length", 0)), 0
-        with open(tmp, "wb") as f:
-            for chunk in dl.iter_content(1 << 20):
-                f.write(chunk); done += len(chunk)
-                progress(f"Pobieram {name} {ver}", int(done * 100 / total) if total else -1)
-    staging = core.ADDONS / f"{slug}.new"
-    shutil.rmtree(staging, ignore_errors=True)
-    with zipfile.ZipFile(tmp) as z:
-        z.extractall(staging)
-    tmp.unlink(missing_ok=True)
-    if not (staging / "manifest.json").exists():
-        shutil.rmtree(staging, ignore_errors=True)
-        raise RuntimeError("Paczka nie zawiera manifest.json")
-    _swap_in("firefox", slug, staging, name, ver)
-    return {"slug": slug, "name": name, "version": ver}
 
 
 # ------------------------------------------------------------------ Chrome (CRX)
@@ -202,7 +157,7 @@ def _fetch_crx(ext_id: str, progress) -> bytes:
                        "z %LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Extensions\\<id>\\<wersja>.")
 
 
-def _finalize(engine: str, slug: str, staging, pub: bytes | None = None) -> dict:
+def _finalize(slug: str, staging, pub: bytes | None = None) -> dict:
     shutil.rmtree(staging / "_metadata", ignore_errors=True)   # dodaje go Chrome; Chromium odrzuca nazwy z „_” (poza _locales)
     mf = staging / "manifest.json"
     if not mf.exists():   # czasem manifest leży piętro niżej (zip z folderem)
@@ -215,11 +170,11 @@ def _finalize(engine: str, slug: str, staging, pub: bytes | None = None) -> dict
         shutil.rmtree(staging, ignore_errors=True)
         raise RuntimeError("Nie znaleziono manifest.json (to nie jest rozpakowane rozszerzenie)")
     manifest = json.loads(mf.read_text("utf-8-sig"))
-    if pub and engine == "chrome":   # stałe ID niezależnie od ścieżki, więc dane rozszerzenia przenoszą się między komputerami
+    if pub:   # stałe ID niezależnie od ścieżki, więc dane rozszerzenia przenoszą się między komputerami
         manifest["key"] = base64.b64encode(pub).decode()
         mf.write_text(json.dumps(manifest), "utf-8")
     name, ver = _resolve_name(staging, manifest), manifest.get("version", "?")
-    _swap_in(engine, slug, staging, name, ver)
+    _swap_in(slug, staging, name, ver)
     return {"slug": slug, "name": name, "version": ver}
 
 
@@ -229,44 +184,43 @@ def install_chrome(ext_id: str, progress) -> dict:
     shutil.rmtree(staging, ignore_errors=True)
     with zipfile.ZipFile(io.BytesIO(zbytes)) as z:
         z.extractall(staging)
-    return _finalize("chrome", ext_id, staging, pub)
+    return _finalize(ext_id, staging, pub)
 
 
-def install_from_file(path, engine: str = "chrome", progress=lambda t, p=-1: None) -> dict:
-    """Instalacja z pliku .crx/.zip/.xpi albo z rozpakowanego folderu (niezależna od sklepu)."""
+def install_from_file(path, progress=lambda t, p=-1: None) -> dict:
+    """Instalacja z pliku .crx/.zip albo z rozpakowanego folderu (niezależna od sklepu)."""
     from pathlib import Path
     p, pub = Path(path), None
     if p.is_dir():
         slug = p.parent.name if re.fullmatch(r"[a-p]{32}", p.parent.name) else "local-" + hashlib.sha1(p.name.encode()).hexdigest()[:10]
-        staging = _root(engine) / f"{slug}.new"
+        staging = core.ADDONS_CHROME / f"{slug}.new"
         shutil.rmtree(staging, ignore_errors=True)
         shutil.copytree(p, staging)
     else:
         data = p.read_bytes()
         zbytes, pub = crx_parse(data) if data[:4] == b"Cr24" or data[:2] == b"PK" else (None, None)
         if zbytes is None:
-            raise RuntimeError("To nie jest plik .crx/.zip/.xpi")
+            raise RuntimeError("To nie jest plik .crx/.zip")
         slug = ext_id_from_key(pub) if pub else "local-" + hashlib.sha1(p.stem.encode()).hexdigest()[:10]
-        staging = _root(engine) / f"{slug}.new"
+        staging = core.ADDONS_CHROME / f"{slug}.new"
         shutil.rmtree(staging, ignore_errors=True)
         with zipfile.ZipFile(io.BytesIO(zbytes)) as z:
             z.extractall(staging)
     progress("Instaluję rozszerzenie…", -1)
-    return _finalize(engine, slug, staging, pub)
+    return _finalize(slug, staging, pub)
 
 
 # ------------------------------------------------------------------ wspólne
-def install(ref: str, engine: str = "firefox", progress=lambda t, p=-1: None) -> dict:
-    ref = parse_ref(ref, engine)
-    return install_chrome(ref, progress) if engine == "chrome" else install_firefox(ref, progress)
+def install(ref: str, progress=lambda t, p=-1: None) -> dict:
+    return install_chrome(parse_ref(ref), progress)
 
 
-def remove(slug: str, engine: str = "firefox"):
-    shutil.rmtree(path(slug, engine), ignore_errors=True)
+def remove(slug: str):
+    shutil.rmtree(path(slug), ignore_errors=True)
 
 
-def ensure(slugs: list[str], engine: str = "firefox", progress=lambda t, p=-1: None):
+def ensure(slugs: list[str], progress=lambda t, p=-1: None):
     """Doinstaluj brakujące (np. po przeniesieniu profilu na drugi komputer)."""
     for s in slugs:
-        if not (path(s, engine) / "manifest.json").exists():
-            install(s, engine, progress)
+        if not (path(s) / "manifest.json").exists():
+            install(s, progress)

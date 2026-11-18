@@ -1,9 +1,8 @@
 """Proces przeglądarki: uruchamiany jako osobny proces (exe --worker <id>), żeby GUI się nie blokowało."""
 import json
 import os
-import time
 
-from . import addons, core
+from . import addons, bookmarks, core
 
 
 def _cfg(pid):
@@ -13,30 +12,9 @@ def _cfg(pid):
 
 def run(pid: str):
     cfg = _cfg(pid)
-    (run_chrome if cfg["engine"] == "chrome" else run_firefox)(pid, cfg)
-
-
-def run_firefox(pid: str, cfg: dict):
-    from camoufox import DefaultAddons
-    from camoufox.sync_api import Camoufox
-
-    fp = core.decode_fp(core.read_fp_encoded(pid))
-    paths = [str(addons.path(s, "firefox")) for s in cfg["addons"]
-             if (addons.path(s, "firefox") / "manifest.json").exists()]
-    opts = dict(
-        persistent_context=True, user_data_dir=str(core.data_dir(pid)), headless=False,
-        fingerprint=fp,                 # ten sam fingerprint na każdym komputerze
-        i_know_what_im_doing=True, addons=paths or None,
-        exclude_addons=[] if cfg["ublock"] else [DefaultAddons.UBO],
-        block_webrtc=bool(cfg["block_webrtc"]), humanize=True if cfg["humanize"] else None,
-        locale=cfg["locale"] or None,
-        config={"timezone": cfg["timezone"]} if cfg["timezone"] else None,
-    )
-    with Camoufox(**{k: v for k, v in opts.items() if v is not None}) as ctx:
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        if cfg["start_url"] and cfg["start_url"] != "about:blank":
-            page.goto(cfg["start_url"])
-        ctx.wait_for_event("close", timeout=0)
+    if cfg["engine"] != "chrome":
+        raise RuntimeError("Profile Firefox (Camoufox) nie są już obsługiwane. Utwórz nowy profil Chrome.")
+    run_chrome(pid, cfg)
 
 
 COOKIES_FILE = "pm-cookies.json"
@@ -65,6 +43,18 @@ def chrome_args(pid: str, cfg: dict, paths: list[str]) -> list[str]:
     return args + os.environ.get("PM_CHROMIUM_EXTRA_ARGS", "").split()
 
 
+def open_start_page(page, url: str):
+    """Strona startowa nie może zabić przeglądarki: błąd nawigacji (brak sieci, zły proxy, timeout, literówka w adresie)
+    kończy się stroną błędu w Chrome, a nie wyjątkiem, który zamykałby cały proces (dawniej goto() rzucał i kończył workera)."""
+    url = core.normalize_url(url)
+    if not url or url == "about:blank":
+        return
+    try:
+        page.goto(url, wait_until="commit", timeout=60000)
+    except Exception as e:
+        print("Strona startowa nie otworzyła się (przeglądarka działa dalej):", type(e).__name__, str(e)[:200], flush=True)
+
+
 def run_chrome(pid: str, cfg: dict):
     """fingerprint-chromium (maskowanie w binarce) sterowany przez Playwright. Seed fingerprintu jest w configu
     profilu, więc na obu komputerach profil wygląda tak samo."""
@@ -77,8 +67,12 @@ def run_chrome(pid: str, cfg: dict):
     if not exe:
         raise RuntimeError("Brak silnika Chrome. Pobierz go w Ustawieniach.")
     data = core.data_dir(pid)
-    paths = [str(addons.path(s, "chrome").resolve()) for s in cfg["addons"]
-             if (addons.path(s, "chrome") / "manifest.json").exists()]
+    try:   # zakładki trzeba wpisać do profilu, zanim Chrome go otworzy (potem nadpisałby plik przy zamknięciu)
+        bookmarks.seed(data, cfg.get("bookmarks") or [])
+    except Exception as e:
+        print("Nie dodano zakładek:", type(e).__name__, e, flush=True)
+    paths = [str(addons.path(s).resolve()) for s in cfg["addons"]
+             if (addons.path(s) / "manifest.json").exists()]
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
             str(data), executable_path=str(exe), headless=False, viewport=None,
@@ -112,8 +106,7 @@ def run_chrome(pid: str, cfg: dict):
                 print("save cookies:", type(e).__name__, str(e)[:200], flush=True)   # np. przeglądarka już zamknięta
 
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        if cfg["start_url"] and cfg["start_url"] != "about:blank":
-            page.goto(cfg["start_url"])
+        open_start_page(page, cfg["start_url"])
         while True:
             try:
                 ctx.wait_for_event("close", timeout=8000)

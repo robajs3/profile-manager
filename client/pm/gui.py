@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
                                QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPlainTextEdit, QProgressDialog, QPushButton, QTableWidget,
@@ -13,8 +13,11 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
 
 import random
 
-from . import addons, chromium, core, sync
+from . import addons, bookmarks, chromium, core, sync
 from .api import Api, ApiError
+
+LEGACY_MSG = ("Ten profil używa silnika Firefox (Camoufox), który został usunięty z aplikacji.\n"
+              "Można go tylko usunąć. Utwórz nowy profil (Chrome).")
 
 ERRORS = {
     "invalid_credentials": "Nieprawidłowy login lub hasło.", "totp_required": "Podaj kod 2FA.",
@@ -183,15 +186,6 @@ class SecurityDialog(QDialog):
 
 
 # ----------------------------------------------------------------- pomocnicze
-def ensure_camoufox(progress):
-    from camoufox.pkgman import CamoufoxFetcher, installed_verstr
-    try:
-        installed_verstr()
-    except Exception:
-        progress("Pobieram przeglądarkę Camoufox (jednorazowo, ok. 100–200 MB)…", -1)
-        CamoufoxFetcher().install()
-
-
 def ensure_chrome_engine(progress):
     chromium.ensure(progress)
 
@@ -204,45 +198,24 @@ class AddonsDialog(QDialog):
         self.setMinimumSize(500, 420)
         self._tasks = []
         lay = QVBoxLayout(self)
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Silnik:"))
-        self.engine = QComboBox()
-        for k, v in core.ENGINES.items():
-            self.engine.addItem(v, k)
-        self.engine.currentIndexChanged.connect(self.rebuild)
-        top.addWidget(self.engine, 1)
-        lay.addLayout(top)
         self.list = QListWidget(); lay.addWidget(self.list)
-        self.presets = QHBoxLayout(); lay.addLayout(self.presets)
         row2 = QHBoxLayout()
         for text, fn in (("Zainstaluj ze sluga / ID / linku…", self.install_custom),
                          ("Aktualizuj wszystkie", self.update_all), ("Usuń zaznaczone", self.remove)):
             b = QPushButton(text); b.clicked.connect(fn); row2.addWidget(b)
         lay.addLayout(row2)
         row3 = QHBoxLayout()
-        for text, fn in (("Dodaj z pliku (.crx / .zip / .xpi)…", self.add_file), ("Dodaj z folderu…", self.add_dir)):
+        for text, fn in (("Dodaj z pliku (.crx / .zip)…", self.add_file), ("Dodaj z folderu…", self.add_dir)):
             b = QPushButton(text); b.clicked.connect(fn); row3.addWidget(b)
         lay.addLayout(row3)
         hint = QLabel("Gdy pobieranie ze sklepu nie działa: zainstaluj rozszerzenie w zwykłym Chrome i wskaż jego folder "
                       "(…\\Chrome\\User Data\\Default\\Extensions\\<id>\\<wersja>).")
         hint.setWordWrap(True); lay.addWidget(hint)
-        self.rebuild()
-
-    def eng(self) -> str:
-        return self.engine.currentData()
-
-    def rebuild(self):
-        while self.presets.count():
-            w = self.presets.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-        for name, ref in addons.PRESETS[self.eng()].items():
-            b = QPushButton(f"+ {name}"); b.clicked.connect(lambda _=False, r=ref: self.install(r)); self.presets.addWidget(b)
         self.refresh()
 
     def refresh(self):
         self.list.clear()
-        for a in addons.installed(self.eng()):
+        for a in addons.installed():
             it = QListWidgetItem(f"{a['name']}  v{a['version']}  [{a['slug']}]")
             it.setData(Qt.UserRole, a["slug"]); self.list.addItem(it)
 
@@ -255,31 +228,30 @@ class AddonsDialog(QDialog):
         self._tasks.append(t); t.start(); dlg.show()
 
     def install(self, ref):
-        eng = self.eng(); self.run(lambda pr: addons.install(ref, eng, pr))
+        self.run(lambda pr: addons.install(ref, pr))
 
     def install_custom(self):
-        hint = "ID lub link z Chrome Web Store:" if self.eng() == "chrome" else "Slug lub link z addons.mozilla.org:"
-        text, ok = QInputDialog.getText(self, "Instalacja", hint)
+        text, ok = QInputDialog.getText(self, "Instalacja", "ID lub link z Chrome Web Store:")
         if ok and text.strip():
             self.install(text)
 
     def add_file(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Wybierz rozszerzenie", "", "Rozszerzenia (*.crx *.zip *.xpi);;Wszystkie pliki (*)")
+        f, _ = QFileDialog.getOpenFileName(self, "Wybierz rozszerzenie", "", "Rozszerzenia (*.crx *.zip);;Wszystkie pliki (*)")
         if f:
-            eng = self.eng(); self.run(lambda pr: addons.install_from_file(f, eng, pr))
+            self.run(lambda pr: addons.install_from_file(f, pr))
 
     def add_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Wybierz folder z rozpakowanym rozszerzeniem (z manifest.json)")
         if d:
-            eng = self.eng(); self.run(lambda pr: addons.install_from_file(d, eng, pr))
+            self.run(lambda pr: addons.install_from_file(d, pr))
 
     def update_all(self):
-        eng = self.eng(); slugs = [a["slug"] for a in addons.installed(eng)]
-        self.run(lambda pr: [addons.install(s, eng, pr) for s in slugs])
+        slugs = [a["slug"] for a in addons.installed()]
+        self.run(lambda pr: [addons.install(s, pr) for s in slugs])
 
     def remove(self):
         for it in self.list.selectedItems():
-            addons.remove(it.data(Qt.UserRole), self.eng())
+            addons.remove(it.data(Qt.UserRole))
         self.refresh()
 
 
@@ -295,7 +267,18 @@ class SettingsDialog(QDialog):
                              "w binarce. Bez kluczy i bez limitu jednoczesnych sesji."))
         self.status = QLabel(); lay.addWidget(self.status)
         b = QPushButton("Pobierz / zaktualizuj silnik Chrome"); b.clicked.connect(self.download); lay.addWidget(b)
+        lay.addWidget(QLabel("<b>Domyślne zakładki dla nowych profili</b><br>Jedna na linię: <i>Tytuł | adres</i> albo sam adres."))
+        self.bm = QPlainTextEdit(self.s.get("default_bookmarks", "")); self.bm.setFixedHeight(110)
+        self.bm.setPlaceholderText("Steam | https://steamcommunity.com\nhttps://example.com")
+        lay.addWidget(self.bm)
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close)
+        bb.accepted.connect(self.save); bb.rejected.connect(self.reject); lay.addWidget(bb)
         self.refresh()
+
+    def save(self):
+        self.s["default_bookmarks"] = bookmarks.to_text(bookmarks.parse_text(self.bm.toPlainText()))
+        core.save_settings(self.s)
+        self.accept()
 
     def refresh(self):
         v = chromium.version()
@@ -312,53 +295,40 @@ class SettingsDialog(QDialog):
 
 # ----------------------------------------------------------------- edycja profilu
 class ProfileDialog(QDialog):
-    def __init__(self, parent, meta: dict | None):
+    def __init__(self, parent, meta: dict | None, default_bookmarks: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Edycja profilu" if meta else "Nowy profil")
         self.setMinimumWidth(480)
         cfg = core.merged_config(meta) if meta else dict(core.DEFAULT_CONFIG)
         self.existing, self.cfg0 = meta is not None, cfg
-        self.orig_os = cfg["os"] if meta else None
         self.name = QLineEdit(meta["name"] if meta else "")
-        self.engine = QComboBox()
-        for k, v in core.ENGINES.items():
-            self.engine.addItem(v, k)
-        self.engine.setCurrentIndex(self.engine.findData(cfg["engine"]))
-        self.engine.setEnabled(not self.existing)     # silnika nie da się zmienić (formaty profili są niekompatybilne)
-        self.os = QComboBox(); self.os.addItems(["windows", "macos", "linux"]); self.os.setCurrentText(cfg["os"])
         self.locale = QLineEdit(cfg["locale"]); self.locale.setPlaceholderText("np. pl-PL, en-US (puste = domyślny)")
         self.tz = QLineEdit(cfg["timezone"]); self.tz.setPlaceholderText("np. Europe/Warsaw (puste = z systemu)")
         self.url = QLineEdit(cfg["start_url"])
         self.webrtc = QCheckBox("Zablokuj WebRTC (wyciek IP)"); self.webrtc.setChecked(cfg["block_webrtc"])
-        self.human = QCheckBox("Humanizuj ruchy myszy (tylko Firefox)"); self.human.setChecked(cfg["humanize"])
-        self.ubo = QCheckBox("uBlock Origin (wbudowany, tylko Firefox)"); self.ubo.setChecked(cfg["ublock"])
         self.sync = QCheckBox("Synchronizuj z serwerem"); self.sync.setChecked(cfg["sync"])
         self.regen = QCheckBox("Wygeneruj nowy fingerprint przy zapisie")
         self.notes = QPlainTextEdit(cfg["notes"]); self.notes.setFixedHeight(60)
+        self.bookmarks = QPlainTextEdit(bookmarks.to_text(cfg["bookmarks"]) if meta else default_bookmarks)
+        self.bookmarks.setFixedHeight(80)
+        self.bookmarks.setPlaceholderText("Tytuł | https://adres  (jedna zakładka na linię; trafią na pasek zakładek przy starcie)")
         self.addons = QListWidget(); self.addons.setFixedHeight(100)
-        self.extra_addons: list[str] = []
         f = QFormLayout(self)
-        for label, w in (("Nazwa", self.name), ("Silnik", self.engine), ("System w fingerprincie", self.os),
-                         ("Język", self.locale), ("Strefa czasowa", self.tz), ("Strona startowa", self.url),
-                         ("Rozszerzenia", self.addons), ("", self.webrtc), ("", self.human), ("", self.ubo),
-                         ("", self.sync), ("Notatki", self.notes)):
+        for label, w in (("Nazwa", self.name), ("Język", self.locale), ("Strefa czasowa", self.tz),
+                         ("Strona startowa", self.url), ("Zakładki", self.bookmarks), ("Rozszerzenia", self.addons),
+                         ("", self.webrtc), ("", self.sync), ("Notatki", self.notes)):
             f.addRow(label, w)
         if meta:
             f.addRow("", self.regen)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         f.addRow(bb)
-        self.engine.currentIndexChanged.connect(self.on_engine)
-        self.on_engine()
+        self.fill_addons()
 
-    def on_engine(self):
-        eng = self.engine.currentData()
-        self.os.setEnabled(eng == "firefox")      # w silniku Chrome platforma wynika z systemu hosta
-        self.ubo.setEnabled(eng == "firefox")
-        self.human.setEnabled(eng == "firefox")
-        selected = set(self.cfg0["addons"]) if (self.existing and eng == self.cfg0["engine"]) else set()
+    def fill_addons(self):
+        selected = set(self.cfg0["addons"])
         self.addons.clear()
-        lib = addons.installed(eng)
+        lib = addons.installed()
         for a in lib:
             it = QListWidgetItem(f"{a['name']} [{a['slug']}]")
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
@@ -370,12 +340,12 @@ class ProfileDialog(QDialog):
     def result_config(self) -> tuple[str, dict, bool]:
         slugs = [self.addons.item(i).data(Qt.UserRole) for i in range(self.addons.count())
                  if self.addons.item(i).checkState() == Qt.Checked] + self.extra_addons
-        cfg = {"engine": self.engine.currentData(), "os": self.os.currentText(), "locale": self.locale.text().strip(),
-               "timezone": self.tz.text().strip(), "start_url": self.url.text().strip() or "about:blank",
-               "block_webrtc": self.webrtc.isChecked(), "humanize": self.human.isChecked(),
-               "ublock": self.ubo.isChecked(), "fp_seed": self.cfg0.get("fp_seed", 0), "addons": slugs, "sync": self.sync.isChecked(),
+        cfg = {"engine": "chrome", "locale": self.locale.text().strip(),
+               "timezone": self.tz.text().strip(), "start_url": core.normalize_url(self.url.text()) or "about:blank",
+               "block_webrtc": self.webrtc.isChecked(), "fp_seed": self.cfg0.get("fp_seed", 0), "addons": slugs,
+               "bookmarks": bookmarks.parse_text(self.bookmarks.toPlainText()), "sync": self.sync.isChecked(),
                "notes": self.notes.toPlainText()}
-        regen = self.regen.isChecked() or (self.orig_os is not None and cfg["engine"] == "firefox" and cfg["os"] != self.orig_os)
+        regen = self.regen.isChecked()
         return self.name.text().strip() or "Profil", cfg, regen
 
 
@@ -398,7 +368,6 @@ class MainWindow(QMainWindow):
         self.pending: dict[str, str] = {}        # wysyłka się nie udała (wejść MOŻNA, ponowienie: „Synchronizuj teraz”)
         self.pending_hb: dict[str, float] = {}
         self._tasks: list[Task] = []
-        self.browser_ready = False
 
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
@@ -460,14 +429,9 @@ class MainWindow(QMainWindow):
 
     # ---- start
     def startup(self):
-        self.run(ensure_camoufox, done=lambda _: self.set_ready(), title="Przygotowuję przeglądarkę…",
-                 failed=lambda e: (self.set_ready(), QMessageBox.warning(self, "Camoufox", f"Nie udało się pobrać przeglądarki:\n{e}\n\nPonowię próbę przy uruchomieniu profilu Firefox.")))
         if not self.has_token():
             self.login()
         self.refresh()
-
-    def set_ready(self):
-        self.browser_ready = True
 
     def login(self):
         if LoginDialog(self, self.api).exec():
@@ -529,14 +493,14 @@ class MainWindow(QMainWindow):
 
     # ---- CRUD
     def new(self):
-        d = ProfileDialog(self, None)
+        d = ProfileDialog(self, None, self.s.get("default_bookmarks", ""))
         if not d.exec():
             return
         name, cfg, _ = d.result_config()
         if cfg["sync"] and not self.has_token():
             return QMessageBox.information(self, "Sync", "Zaloguj się, aby synchronizować profil, albo odznacz „Synchronizuj”.")
         def job(pr):
-            pr("Tworzę profil (dla Firefoksa: generuję fingerprint, za pierwszym razem pobiera model)…", -1)
+            pr("Tworzę profil…", -1)
             meta = core.create_local(name, cfg)
             if cfg["sync"]:
                 try:
@@ -550,27 +514,21 @@ class MainWindow(QMainWindow):
         meta = self.selected()
         if not meta or self.active(meta["id"]):
             return
+        if core.merged_config(meta)["engine"] != "chrome":
+            return QMessageBox.information(self, "Profile Manager", LEGACY_MSG)
         d = ProfileDialog(self, meta)
         if not d.exec():
             return
         name, cfg, regen = d.result_config()
         pid = meta["id"]
         def job(pr):
-            fp = None
-            if regen and cfg["engine"] == "firefox":
-                pr("Generuję nowy fingerprint…", -1)
-                fp = core.encode_fp(core.generate_fp(cfg["os"]))
-            if regen and cfg["engine"] == "chrome":     # nowy seed = nowy fingerprint (trafia do configu i na serwer)
+            if regen:                                   # nowy seed = nowy fingerprint (trafia do configu i na serwer)
                 cfg["fp_seed"] = random.randint(100000, 2**31 - 1)
             if cfg["sync"] and self.has_token():
                 if pid in self.server:
-                    kw = {"name": name, "config": cfg}
-                    if fp: kw["fingerprint"] = fp
-                    self.api.update_profile(pid, **kw)
+                    self.api.update_profile(pid, name=name, config=cfg)
                 else:
-                    self.api.create_profile(pid, name, cfg, fp or core.read_fp_encoded(pid))
-            if fp:
-                core.write_fp_encoded(pid, fp)
+                    self.api.create_profile(pid, name, cfg, core.read_fp_encoded(pid))
             core.update_meta(pid, name=name, config=cfg)
         self.run(job, lambda _: self.refresh(), title="Zapisuję…")
 
@@ -602,17 +560,14 @@ class MainWindow(QMainWindow):
         if pid in self.running or pid in self.busy:
             return
         local_mode = pid in self.uploading or pid in self.pending or pid in self.next_snap
-        if cfg["engine"] == "firefox" and not self.browser_ready:
-            return QMessageBox.information(self, "Profile Manager", "Przeglądarka jeszcze się pobiera, poczekaj chwilę.")
+        if cfg["engine"] != "chrome":
+            return QMessageBox.information(self, "Profile Manager", LEGACY_MSG)
         if cfg["sync"] and not local_mode and not self.has_token():
             return QMessageBox.information(self, "Sync", "Ten profil jest synchronizowany. Zaloguj się, żeby go uruchomić.")
         self.busy.add(pid); self.pending.pop(pid, None); self.fill()
         def job(pr):
-            addons.ensure(cfg["addons"], cfg["engine"], pr)
-            if cfg["engine"] == "chrome":
-                ensure_chrome_engine(pr)
-            else:
-                ensure_camoufox(pr)
+            addons.ensure(cfg["addons"], pr)
+            ensure_chrome_engine(pr)
             if local_mode:                     # lokalny katalog jest najnowszy, blokada nadal nasza
                 sync.prepare_local(pid)
                 return ""
