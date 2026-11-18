@@ -73,5 +73,19 @@ with SessionLocal() as db:
     pr = db.get(Profile, pid); pr.lock_expires_at = datetime.now(timezone.utc) - timedelta(seconds=300); db.commit()
 B.lock(pid)
 expect("A po przejęciu blokady przez B", "lock_required", lambda: A.upload(pid, tmp / "y", 3))
+# --- wejście do profilu w trakcie wysyłki: migawka 1 się wysyła, a w tym czasie profil działa ponownie i daje migawkę 2
+B.unlock(pid); A.lock(pid); core.update_meta(pid, revision=3)
+d = core.data_dir(pid)
+(d / "cookies.sqlite").write_bytes(b"sesja-3"); s1 = sync.snapshot(pid, nop)
+sync.prepare_local(pid)                                   # ponowne wejście bez blokowania i bez pobierania
+(d / "cookies.sqlite").write_bytes(b"sesja-4"); s2 = sync.snapshot(pid, nop)
+sync.upload_snapshot(A, pid, s1, nop); assert core.load_meta(pid)["revision"] == 4
+sync.upload_snapshot(A, pid, s2, nop); assert core.load_meta(pid)["revision"] == 5
+assert not s1.exists() and not s2.exists()
+(d / "cookies.sqlite").write_bytes(b"lokalnie-zepsute")
+dl = tmp / "check.dl"; A.download(pid, dl); sync.unpack(dl, d)
+assert (d / "cookies.sqlite").read_bytes() == b"sesja-4"; print("ok   łańcuch migawek: serwer ma stan ostatniej sesji (rew. 5)")
+sync.release(A, pid); assert core.load_meta(pid)["dirty"] is False; print("ok   release zwalnia blokadę")
+B.lock(pid); print("ok   B może teraz zająć profil")
 print("\nWSZYSTKO OK")
 os._exit(0)

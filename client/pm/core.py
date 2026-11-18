@@ -4,21 +4,26 @@ import gzip
 import json
 import os
 import platform
+import random
 import shutil
+import threading
 import uuid
 from pathlib import Path
 
 ROOT = Path(os.environ.get("APPDATA") or Path.home() / ".config") / "ProfileManager"
 PROFILES = ROOT / "profiles"
-ADDONS = ROOT / "addons"
+ADDONS = ROOT / "addons"                 # rozszerzenia Firefox (AMO)
+ADDONS_CHROME = ROOT / "addons_chrome"   # rozszerzenia Chrome (CRX rozpakowane)
 LOGS = ROOT / "logs"
 TMP = ROOT / "tmp"
 SETTINGS_FILE = ROOT / "settings.json"
-for _d in (PROFILES, ADDONS, LOGS, TMP):
+for _d in (PROFILES, ADDONS, ADDONS_CHROME, LOGS, TMP):
     _d.mkdir(parents=True, exist_ok=True)
 
+ENGINES = {"firefox": "Firefox (Camoufox)", "chrome": "Chrome (fingerprint-chromium)"}
+
 DEFAULT_CONFIG = {
-    "os": "windows", "locale": "", "timezone": "", "start_url": "about:blank",
+    "engine": "firefox", "fp_seed": 0, "os": "windows", "locale": "", "timezone": "", "start_url": "about:blank",
     "block_webrtc": False, "humanize": False, "ublock": False,
     "addons": [], "sync": True, "notes": "",
 }
@@ -71,9 +76,27 @@ def load_meta(pid: str) -> dict | None:
         return None
 
 
+_meta_lock = threading.RLock()
+
+
 def save_meta(meta: dict):
-    pdir(meta["id"]).mkdir(parents=True, exist_ok=True)
-    (pdir(meta["id"]) / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), "utf-8")
+    with _meta_lock:
+        pdir(meta["id"]).mkdir(parents=True, exist_ok=True)
+        f = pdir(meta["id"]) / "meta.json"
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), "utf-8")
+        os.replace(tmp, f)
+
+
+def update_meta(pid: str, **kw) -> dict | None:
+    """Atomowy odczyt-zmiana-zapis (kilka wątków może dotykać meta.json jednocześnie)."""
+    with _meta_lock:
+        m = load_meta(pid)
+        if m is None:
+            return None
+        m.update(kw)
+        save_meta(m)
+        return m
 
 
 def list_local() -> list[dict]:
@@ -98,7 +121,11 @@ def write_fp_encoded(pid: str, s: str):
 def create_local(name: str, config: dict) -> dict:
     pid = str(uuid.uuid4())
     cfg = {**DEFAULT_CONFIG, **config}
-    write_fp_encoded(pid, encode_fp(generate_fp(cfg["os"])))
+    if cfg["engine"] == "chrome":   # seed fingerprintu leży w configu profilu, więc synchronizuje się z serwerem
+        cfg["fp_seed"] = cfg.get("fp_seed") or random.randint(100000, 2**31 - 1)
+        write_fp_encoded(pid, encode_fp({"engine": "chrome"}))
+    else:
+        write_fp_encoded(pid, encode_fp(generate_fp(cfg["os"])))
     meta = {"id": pid, "name": name, "config": cfg, "revision": 0, "dirty": False}
     save_meta(meta)
     return meta
