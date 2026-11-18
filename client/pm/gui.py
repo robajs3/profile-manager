@@ -5,11 +5,12 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressDialog,
                                QPushButton, QScrollArea, QVBoxLayout, QWidget)
@@ -32,6 +33,14 @@ ERRORS = {
     "lock_lost": "Utracono blokadę profilu (serwer przejął ją po przerwie w łączności).",
     "checksum_mismatch": "Pobrany profil jest uszkodzony (zła suma kontrolna).",
 }
+
+
+PRESET_KEYS = ("locale", "timezone", "start_url", "block_webrtc", "addons", "bookmarks", "sync", "notes")
+
+
+def preset_cfg(cfg: dict) -> dict:
+    """Z configu profilu zostawia tylko to, co ma sens we wzorcu (bez seeda fingerprintu i silnika)."""
+    return {k: (list(cfg[k]) if isinstance(cfg[k], list) else cfg[k]) for k in PRESET_KEYS if k in cfg}
 
 
 def err_text(e: Exception) -> str:
@@ -296,9 +305,14 @@ class SettingsDialog(QDialog):
 
 # ----------------------------------------------------------------- edycja profilu
 class ProfileDialog(QDialog):
-    def __init__(self, parent, meta: dict | None, default_bookmarks: str = ""):
+    def __init__(self, parent, meta: dict | None, default_bookmarks: str = "", presets: list | None = None,
+                 on_save_preset=None, preset_mode: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("Edycja profilu" if meta else "Nowy profil")
+        self.preset_mode, self.presets, self.on_save_preset = preset_mode, presets or [], on_save_preset
+        if preset_mode:
+            self.setWindowTitle("Edycja presetu" if meta else "Nowy preset")
+        else:
+            self.setWindowTitle("Edycja profilu" if meta else "Nowy profil")
         self.setMinimumWidth(480)
         cfg = core.merged_config(meta) if meta else dict(core.DEFAULT_CONFIG)
         self.existing, self.cfg0 = meta is not None, cfg
@@ -315,16 +329,56 @@ class ProfileDialog(QDialog):
         self.bookmarks.setPlaceholderText("Tytuł | https://adres  (jedna zakładka na linię; trafią na pasek zakładek przy starcie)")
         self.addons = QListWidget(); self.addons.setFixedHeight(100)
         f = QFormLayout(self)
-        for label, w in (("Nazwa", self.name), ("Język", self.locale), ("Strefa czasowa", self.tz),
+        if not preset_mode:
+            self.preset_box = QComboBox()
+            self.preset_box.activated.connect(self.apply_preset)
+            f.addRow("Preset", self.preset_box)
+            self.fill_presets()
+        for label, w in (("Nazwa presetu" if preset_mode else "Nazwa", self.name), ("Język", self.locale), ("Strefa czasowa", self.tz),
                          ("Strona startowa", self.url), ("Zakładki", self.bookmarks), ("Rozszerzenia", self.addons),
                          ("", self.webrtc), ("", self.sync), ("Notatki", self.notes)):
             f.addRow(label, w)
-        if meta:
+        if meta and not preset_mode:
             f.addRow("", self.regen)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        if not preset_mode:
+            b_preset = bb.addButton("Zapisz jako preset…", QDialogButtonBox.ActionRole)
+            b_preset.clicked.connect(self.save_as_preset)
         f.addRow(bb)
         self.fill_addons()
+
+    # ---- presety
+    def fill_presets(self):
+        self.preset_box.clear()
+        self.preset_box.addItem("— bez presetu —", None)
+        for p in self.presets:
+            self.preset_box.addItem(p["name"], p["id"])
+
+    def apply_preset(self, index: int):
+        pid = self.preset_box.itemData(index)
+        p = next((x for x in self.presets if x["id"] == pid), None)
+        if not p:
+            return
+        c = {**core.DEFAULT_CONFIG, **p["config"]}       # nazwy profilu nie ruszamy
+        self.locale.setText(c["locale"]); self.tz.setText(c["timezone"]); self.url.setText(c["start_url"])
+        self.webrtc.setChecked(c["block_webrtc"]); self.sync.setChecked(c["sync"])
+        self.notes.setPlainText(c["notes"]); self.bookmarks.setPlainText(bookmarks.to_text(c["bookmarks"]))
+        self.cfg0 = {**self.cfg0, "addons": list(c["addons"])}
+        self.fill_addons()
+
+    def save_as_preset(self):
+        name, ok = QInputDialog.getText(self, "Nowy preset", "Nazwa presetu:", text=self.name.text())
+        name = name.strip()
+        if not ok or not name or not self.on_save_preset:
+            return
+        if any(p["name"].lower() == name.lower() for p in self.presets):
+            if QMessageBox.question(self, "Preset", f"Preset „{name}” już istnieje. Nadpisać?") != QMessageBox.Yes:
+                return
+        _, cfg, _ = self.result_config()
+        self.presets = self.on_save_preset(name, preset_cfg(cfg))
+        self.fill_presets()
+        self.preset_box.setCurrentIndex(max(0, self.preset_box.findText(name)))
 
     def fill_addons(self):
         selected = set(self.cfg0["addons"])
@@ -348,6 +402,74 @@ class ProfileDialog(QDialog):
                "notes": self.notes.toPlainText()}
         regen = self.regen.isChecked()
         return self.name.text().strip() or "Profil", cfg, regen
+
+
+# ----------------------------------------------------------------- presety
+class PresetsDialog(QDialog):
+    """Zarządzanie presetami: wzorcami (zakładki, rozszerzenia, strona startowa…) do tworzenia nowych profili."""
+
+    def __init__(self, parent, win: "MainWindow"):
+        super().__init__(parent)
+        self.win = win
+        self.setWindowTitle("Presety profili")
+        self.setMinimumSize(520, 380)
+        lay = QVBoxLayout(self)
+        intro = QLabel("Preset to gotowy zestaw ustawień (strona startowa, zakładki, rozszerzenia, język…), "
+                       "który wybierasz przy tworzeniu lub edycji profilu.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        self.list = QListWidget(); self.list.itemDoubleClicked.connect(lambda _: self.edit())
+        lay.addWidget(self.list)
+        row = QHBoxLayout()
+        for text, fn in (("Nowy", self.new), ("Edytuj", self.edit), ("Duplikuj", self.duplicate), ("Usuń", self.remove)):
+            b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
+        lay.addLayout(row)
+        self.refresh()
+
+    @property
+    def presets(self) -> list:
+        return self.win.presets_list()
+
+    def refresh(self):
+        self.list.clear()
+        for p in self.presets:
+            c = {**core.DEFAULT_CONFIG, **p["config"]}
+            start = c["start_url"] if c["start_url"] != "about:blank" else "—"
+            it = QListWidgetItem(f"{p['name']}   ·   start: {start}   ·   rozszerzenia: {len(c['addons'])}   ·   zakładki: {len(c['bookmarks'])}")
+            it.setData(Qt.UserRole, p["id"]); self.list.addItem(it)
+
+    def current(self) -> dict | None:
+        it = self.list.currentItem()
+        return next((p for p in self.presets if it and p["id"] == it.data(Qt.UserRole)), None)
+
+    def new(self):
+        d = ProfileDialog(self, None, self.win.s.get("default_bookmarks", ""), preset_mode=True)
+        if d.exec():
+            name, cfg, _ = d.result_config()
+            self.win.save_preset(name, preset_cfg(cfg)); self.refresh()
+
+    def edit(self):
+        p = self.current()
+        if not p:
+            return
+        d = ProfileDialog(self, {"name": p["name"], "config": p["config"]}, preset_mode=True)
+        if d.exec():
+            name, cfg, _ = d.result_config()
+            p["name"], p["config"] = name, preset_cfg(cfg)
+            core.save_settings(self.win.s); self.refresh()
+
+    def duplicate(self):
+        p = self.current()
+        if p:
+            self.win.presets_list().append({"id": str(uuid.uuid4()), "name": p["name"] + " (kopia)",
+                                            "config": preset_cfg(p["config"])})
+            core.save_settings(self.win.s); self.refresh()
+
+    def remove(self):
+        p = self.current()
+        if p and QMessageBox.question(self, "Usuń", f"Usunąć preset „{p['name']}”?\nProfile utworzone z presetu zostają bez zmian.") == QMessageBox.Yes:
+            self.presets.remove(p)
+            core.save_settings(self.win.s); self.refresh()
 
 
 # ----------------------------------------------------------------- styl
@@ -545,7 +667,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"Profile Manager {__version__}")
         self.resize(1000, 640)
-        self.setMinimumSize(700, 420)
+        self.setMinimumSize(820, 420)
         self.s = core.load_settings()
         self.api = Api(self.s)
         self.server: dict[str, dict] = {}
@@ -568,7 +690,7 @@ class MainWindow(QMainWindow):
         self.conn = QLabel(); self.conn.setObjectName("conn")
         title.setMinimumWidth(190)
         head.addWidget(title); head.addStretch()
-        for text, fn, name in (("+ Nowy profil", self.new, "primary"), ("Rozszerzenia", self.open_addons, ""),
+        for text, fn, name in (("+ Nowy profil", self.new, "primary"), ("Presety", self.open_presets, ""), ("Rozszerzenia", self.open_addons, ""),
                                ("Ustawienia", self.open_settings, ""), ("Konto / 2FA", self.open_security, ""),
                                ("Odśwież", self.refresh, ""), ("Logowanie", self.login, "")):
             b = QPushButton(text)
@@ -688,7 +810,7 @@ class MainWindow(QMainWindow):
 
     # ---- CRUD
     def new(self):
-        d = ProfileDialog(self, None, self.s.get("default_bookmarks", ""))
+        d = ProfileDialog(self, None, self.s.get("default_bookmarks", ""), self.presets_list(), self.save_preset)
         if not d.exec():
             return
         name, cfg, _ = d.result_config()
@@ -711,7 +833,7 @@ class MainWindow(QMainWindow):
             return
         if core.merged_config(meta)["engine"] != "chrome":
             return QMessageBox.information(self, "Profile Manager", LEGACY_MSG)
-        d = ProfileDialog(self, meta)
+        d = ProfileDialog(self, meta, "", self.presets_list(), self.save_preset)
         if not d.exec():
             return
         name, cfg, regen = d.result_config()
@@ -737,6 +859,24 @@ class MainWindow(QMainWindow):
                 self.api.delete_profile(pid)
             core.delete_local(pid)
         self.run(job, lambda _: self.refresh())
+
+    def presets_list(self) -> list:
+        return self.s.setdefault("presets", [])
+
+    def save_preset(self, name: str, cfg: dict) -> list:
+        """Dodaje preset albo nadpisuje istniejący o tej samej nazwie. Zwraca aktualną listę."""
+        lst = self.presets_list()
+        for p in lst:
+            if p["name"].lower() == name.lower():
+                p["name"], p["config"] = name, cfg
+                break
+        else:
+            lst.append({"id": str(uuid.uuid4()), "name": name, "config": cfg})
+        core.save_settings(self.s)
+        return lst
+
+    def open_presets(self):
+        PresetsDialog(self, self).exec()
 
     def open_addons(self): AddonsDialog(self).exec()
 
