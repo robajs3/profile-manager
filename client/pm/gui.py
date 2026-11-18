@@ -1,3 +1,7 @@
+import hashlib
+import os
+import random
+import signal
 import subprocess
 import sys
 import time
@@ -5,15 +9,12 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
-                               QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QProgressDialog, QPushButton, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget, QHeaderView)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+                               QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressDialog,
+                               QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
-import random
-
-from . import addons, bookmarks, chromium, core, sync
+from . import __version__, addons, bookmarks, chromium, core, sync
 from .api import Api, ApiError
 
 LEGACY_MSG = ("Ten profil używa silnika Firefox (Camoufox), który został usunięty z aplikacji.\n"
@@ -349,14 +350,202 @@ class ProfileDialog(QDialog):
         return self.name.text().strip() or "Profil", cfg, regen
 
 
-# ----------------------------------------------------------------- okno główne
-class MainWindow(QMainWindow):
-    COLS = ["Nazwa", "Silnik", "Rozszerzenia", "Sync", "Status"]
+# ----------------------------------------------------------------- styl
+STYLE = """
+QWidget { background: #0d1117; color: #e6edf3; font-size: 13px; }
+QLabel { background: transparent; }
+QDialog, QMessageBox, QProgressDialog { background: #0d1117; }
+QLineEdit, QPlainTextEdit, QListWidget {
+    background: #010409; border: 1px solid #30363d; border-radius: 6px; padding: 5px;
+    selection-background-color: #1f6feb; }
+QLineEdit:focus, QPlainTextEdit:focus { border-color: #58a6ff; }
+QPushButton { background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; }
+QPushButton:hover { background: #30363d; }
+QPushButton:disabled { color: #6e7681; background: #161b22; border-color: #21262d; }
+QPushButton#primary { background: #238636; border-color: #2ea043; color: white; font-weight: 600; }
+QPushButton#primary:hover { background: #2ea043; }
+QPushButton#primary:disabled { background: #16301d; color: #6e7681; border-color: #16301d; }
+QPushButton#danger { background: #2d1417; border-color: #6e2128; color: #ff7b72; font-weight: 600; }
+QPushButton#danger:hover { background: #da3633; color: white; }
+QPushButton#danger:disabled { background: #161b22; color: #484f58; border-color: #21262d; }
+QPushButton#small { padding: 4px 8px; background: transparent; border-color: #30363d; color: #8b949e; }
+QPushButton#small:hover { background: #21262d; color: #e6edf3; }
+QPushButton#small:disabled { color: #484f58; border-color: #21262d; }
+QLabel#title { font-size: 22px; font-weight: 700; }
+QLabel#conn { color: #8b949e; padding: 0 10px; }
+QFrame#Tile { background: #161b22; border: 1px solid #30363d; border-radius: 12px; }
+QFrame#Tile:hover { border-color: #58a6ff; }
+QFrame#NewTile { background: transparent; border: 2px dashed #30363d; border-radius: 12px; }
+QFrame#NewTile:hover { border-color: #58a6ff; background: #11161d; }
+QLabel#tname { font-size: 15px; font-weight: 600; }
+QLabel#muted { color: #8b949e; font-size: 12px; }
+QScrollArea, QWidget#gridbox { background: transparent; border: none; }
+QStatusBar { background: #010409; border-top: 1px solid #21262d; color: #8b949e; }
+QStatusBar::item { border: none; }
+QLabel#version { color: #8b949e; padding: 0 10px; font-weight: 600; }
+QToolTip { background: #161b22; color: #e6edf3; border: 1px solid #30363d; padding: 4px; }
+QScrollBar:vertical { background: transparent; width: 10px; }
+QScrollBar::handle:vertical { background: #30363d; border-radius: 5px; min-height: 30px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
+
+TILE_W, TILE_H, GAP = 290, 224, 16
+
+KIND_COLOR = {"running": "#3fb950", "busy": "#d29922", "upload": "#58a6ff", "error": "#f85149",
+              "locked": "#db6d28", "update": "#58a6ff", "ready": "#8b949e", "new": "#d29922"}
+AVATARS = ["#1f6feb", "#8957e5", "#238636", "#db6d28", "#bf3989", "#0e8a9c", "#9e6a03", "#da3633"]
+
+
+def short(text: str, n: int = 70) -> str:
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def kill_tree(proc: subprocess.Popen):
+    """Zabija proces workera razem z przeglądarką i sterownikiem (całe drzewo procesów)."""
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:  # noqa
+        pass
+    try:
+        proc.kill()
+    except Exception:  # noqa
+        pass
+
+
+# ----------------------------------------------------------------- kafelki
+class Tile(QFrame):
+    """Kafelek profilu z przyciskami Start / Force stop / Edytuj / Usuń (/ Sync)."""
+
+    def __init__(self, win: "MainWindow", m: dict, cfg: dict, kind: str, status: str):
+        super().__init__()
+        self.setObjectName("Tile")
+        self.setFixedSize(TILE_W, TILE_H)
+        self.win, self.pid = win, m["id"]
+        pid = self.pid
+        running = pid in win.running
+        active = win.active(pid)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout(); head.setSpacing(12)
+        av = QLabel((m["name"].strip()[:1] or "?").upper())
+        av.setFixedSize(42, 42); av.setAlignment(Qt.AlignCenter)
+        color = AVATARS[int(hashlib.md5(pid.encode()).hexdigest()[:6], 16) % len(AVATARS)]
+        av.setStyleSheet(f"background:{color}; color:white; border-radius:21px; font-size:19px; font-weight:700;")
+        head.addWidget(av)
+        col = QVBoxLayout(); col.setSpacing(2)
+        name = QLabel(short(m["name"], 24)); name.setObjectName("tname"); name.setToolTip(m["name"])
+        st = QLabel(f"<span style='color:{KIND_COLOR.get(kind, '#8b949e')}'>●</span> {short(status, 46)}")
+        st.setObjectName("muted"); st.setToolTip(status)
+        col.addWidget(name); col.addWidget(st)
+        head.addLayout(col, 1)
+        lay.addLayout(head)
+
+        sync_txt = f"rew. {m['revision']}" if cfg["sync"] else "tylko lokalnie"
+        n_ext, n_bm = len(cfg["addons"]), len(cfg.get("bookmarks") or [])
+        info = QLabel(f"Chrome · {sync_txt}<br>Rozszerzenia: {n_ext} · Zakładki: {n_bm}")
+        info.setObjectName("muted")
+        lay.addWidget(info)
+        extra = cfg["start_url"] if cfg["start_url"] != "about:blank" else (cfg["notes"].splitlines() or [""])[0]
+        sub = QLabel(short(extra, 40)); sub.setObjectName("muted"); sub.setToolTip(extra)
+        lay.addWidget(sub)
+        lay.addStretch()
+
+        row = QHBoxLayout(); row.setSpacing(8)
+        b_start = QPushButton("▶  Start"); b_start.setObjectName("primary")
+        b_start.setEnabled(not running and pid not in win.busy)
+        b_start.clicked.connect(lambda _=False: win.launch(pid))
+        b_stop = QPushButton("■  Force stop"); b_stop.setObjectName("danger")
+        b_stop.setEnabled(running)
+        b_stop.clicked.connect(lambda _=False: win.force_stop(pid))
+        row.addWidget(b_start); row.addWidget(b_stop)
+        lay.addLayout(row)
+
+        row2 = QHBoxLayout(); row2.setSpacing(6)
+        b_edit = QPushButton("Edytuj"); b_edit.setObjectName("small"); b_edit.setEnabled(not active)
+        b_edit.clicked.connect(lambda _=False: win.edit(pid))
+        b_del = QPushButton("Usuń"); b_del.setObjectName("small"); b_del.setEnabled(not active)
+        b_del.clicked.connect(lambda _=False: win.delete(pid))
+        row2.addWidget(b_edit); row2.addWidget(b_del)
+        if pid in win.pending and not running and pid not in win.busy:
+            b_sync = QPushButton("Synchronizuj"); b_sync.setObjectName("small")
+            b_sync.clicked.connect(lambda _=False: win.sync_now(pid))
+            row2.addWidget(b_sync)
+        lay.addLayout(row2)
+
+    def mouseDoubleClickEvent(self, ev):
+        if self.pid not in self.win.running and self.pid not in self.win.busy:
+            self.win.launch(self.pid)
+
+
+class NewTile(QFrame):
+    def __init__(self, callback):
+        super().__init__()
+        self.setObjectName("NewTile")
+        self.setFixedSize(TILE_W, TILE_H)
+        self.setCursor(Qt.PointingHandCursor)
+        self.callback = callback
+        lay = QVBoxLayout(self)
+        plus = QLabel("+"); plus.setAlignment(Qt.AlignCenter)
+        plus.setStyleSheet("font-size: 44px; color: #58a6ff; font-weight: 300;")
+        txt = QLabel("Nowy profil"); txt.setAlignment(Qt.AlignCenter); txt.setObjectName("muted")
+        lay.addStretch(); lay.addWidget(plus); lay.addWidget(txt); lay.addStretch()
+
+    def mousePressEvent(self, ev):
+        self.callback()
+
+
+class TileGrid(QScrollArea):
+    """Siatka kafelków, która sama dobiera liczbę kolumn do szerokości okna."""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Profile Manager")
-        self.resize(980, 480)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.box = QWidget(); self.box.setObjectName("gridbox")
+        self.grid = QGridLayout(self.box)
+        self.grid.setSpacing(GAP)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setWidget(self.box)
+        self.tiles: list[QWidget] = []
+        self._cols = 0
+
+    def set_tiles(self, tiles: list[QWidget]):
+        for t in self.tiles:
+            self.grid.removeWidget(t); t.hide(); t.setParent(None); t.deleteLater()
+        self.tiles = tiles
+        self.relayout()
+
+    def relayout(self):
+        cols = max(1, (self.viewport().width() + GAP) // (TILE_W + GAP))
+        self._cols = cols
+        for t in self.tiles:
+            self.grid.removeWidget(t)
+        for i, t in enumerate(self.tiles):
+            self.grid.addWidget(t, i // cols, i % cols)
+            t.show()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if max(1, (self.viewport().width() + GAP) // (TILE_W + GAP)) != self._cols:
+            self.relayout()
+
+
+# ----------------------------------------------------------------- okno główne
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"Profile Manager {__version__}")
+        self.resize(1000, 640)
+        self.setMinimumSize(700, 420)
         self.s = core.load_settings()
         self.api = Api(self.s)
         self.server: dict[str, dict] = {}
@@ -365,28 +554,38 @@ class MainWindow(QMainWindow):
         self.busy: set[str] = set()              # operacje, w trakcie których nie wolno uruchamiać (przygotowanie, pakowanie)
         self.uploading: set[str] = set()         # trwa wysyłka (wejść do profilu MOŻNA)
         self.next_snap: dict[str, Path] = {}     # najnowsza migawka czekająca na koniec trwającej wysyłki
-        self.pending: dict[str, str] = {}        # wysyłka się nie udała (wejść MOŻNA, ponowienie: „Synchronizuj teraz”)
+        self.pending: dict[str, str] = {}        # wysyłka się nie udała (wejść MOŻNA, ponowienie: „Synchronizuj”)
         self.pending_hb: dict[str, float] = {}
         self._tasks: list[Task] = []
 
-        self.table = QTableWidget(0, len(self.COLS))
-        self.table.setHorizontalHeaderLabels(self.COLS)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.doubleClicked.connect(self.launch)
-        box = QWidget(); lay = QVBoxLayout(box); lay.addWidget(self.table)
-        for buttons in ((("Nowy", self.new), ("Uruchom", self.launch), ("Edytuj", self.edit), ("Usuń", self.delete),
-                         ("Synchronizuj teraz", self.sync_now)),
-                        (("Rozszerzenia", self.open_addons), ("Ustawienia", self.open_settings),
-                         ("2FA / konto", self.open_security), ("Odśwież", self.refresh),
-                         ("Zaloguj / zmień serwer", self.login))):
-            row = QHBoxLayout()
-            for text, fn in buttons:
-                b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
-            lay.addLayout(row)
-        self.setCentralWidget(box)
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(24, 18, 24, 12)
+        root.setSpacing(16)
+
+        head = QHBoxLayout(); head.setSpacing(8)
+        title = QLabel("Profile Manager"); title.setObjectName("title")
+        self.conn = QLabel(); self.conn.setObjectName("conn")
+        title.setMinimumWidth(190)
+        head.addWidget(title); head.addStretch()
+        for text, fn, name in (("+ Nowy profil", self.new, "primary"), ("Rozszerzenia", self.open_addons, ""),
+                               ("Ustawienia", self.open_settings, ""), ("Konto / 2FA", self.open_security, ""),
+                               ("Odśwież", self.refresh, ""), ("Logowanie", self.login, "")):
+            b = QPushButton(text)
+            if name:
+                b.setObjectName(name)
+            b.clicked.connect(fn)
+            head.addWidget(b)
+        root.addLayout(head)
+
+        self.grid = TileGrid()
+        root.addWidget(self.grid, 1)
+        self.setCentralWidget(central)
+
+        ver = QLabel(f"Wersja {__version__}"); ver.setObjectName("version")
+        self.statusBar().addPermanentWidget(self.conn)
+        self.statusBar().addPermanentWidget(ver)
+        self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage("Start…")
         self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(1000)
         QTimer.singleShot(0, self.startup)
@@ -416,10 +615,6 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Profile Manager", err_text(e))
         if isinstance(e, ApiError) and e.status == 401:
             self.login()
-
-    def selected(self) -> dict | None:
-        r = self.table.currentRow()
-        return core.load_meta(self.table.item(r, 0).data(Qt.UserRole)) if r >= 0 else None
 
     def has_token(self) -> bool:
         return bool(self.s.get("token") and self.s.get("server_url"))
@@ -459,37 +654,37 @@ class MainWindow(QMainWindow):
             self.fill()
         self.run(lambda _: self.api.list_profiles(), ok, bad, modal=False)
 
-    def status_text(self, m: dict, cfg: dict) -> str:
+    def status(self, m: dict, cfg: dict) -> tuple[str, str]:
+        """(rodzaj, tekst) statusu profilu; rodzaj wybiera kolor kropki na kafelku."""
         pid, srv = m["id"], self.server.get(m["id"])
         if pid in self.running:
-            return "▶ uruchomiony" + (" · wysyłka poprzedniej sesji…" if pid in self.uploading else "")
+            return "running", "uruchomiony" + (" · wysyłka poprzedniej sesji…" if pid in self.uploading else "")
         if pid in self.busy:
-            return "… trwa operacja"
+            return "busy", "trwa operacja…"
         if pid in self.uploading or pid in self.next_snap:
-            return "⬆ wysyłanie na serwer (można wejść do profilu)"
+            return "upload", "wysyłanie na serwer (można wejść)"
         if pid in self.pending:
-            return "⚠ błąd wysyłki (można wejść): " + self.pending[pid]
+            return "error", "błąd wysyłki: " + self.pending[pid]
         if cfg["sync"] and self.online and srv is None:
-            return "brak na serwerze (zapisz profil, by wysłać)"
+            return "new", "brak na serwerze (zapisz profil)"
         if srv and srv["lock"]["active"] and srv["lock"]["device_id"] != self.s["device_id"]:
-            return f"🔒 używany na: {srv['lock']['device_name']}"
+            return "locked", f"używany na: {srv['lock']['device_name']}"
         if cfg["sync"] and srv and srv["revision"] != m["revision"]:
-            return "⬇ nowsza wersja na serwerze"
-        return "✓ gotowy"
+            return "update", "nowsza wersja na serwerze"
+        return "ready", "gotowy"
 
     def fill(self):
-        keep = self.table.currentRow()
-        metas = core.list_local()
-        self.table.setRowCount(len(metas))
-        for i, m in enumerate(metas):
+        if self.online:
+            self.conn.setText(f"<span style='color:#3fb950'>●</span> online · {self.s.get('username') or ''}")
+        else:
+            self.conn.setText("<span style='color:#f85149'>●</span> offline")
+        tiles: list[QWidget] = []
+        for m in core.list_local():
             cfg = core.merged_config(m)
-            sync_txt = ("rew. %d" % m["revision"]) if cfg["sync"] else "tylko lokalnie"
-            vals = [m["name"], core.ENGINES.get(cfg["engine"], cfg["engine"]), ", ".join(cfg["addons"]) or "—",
-                    sync_txt, self.status_text(m, cfg)]
-            for j, v in enumerate(vals):
-                it = QTableWidgetItem(v); it.setData(Qt.UserRole, m["id"]); self.table.setItem(i, j, it)
-        if 0 <= keep < len(metas):
-            self.table.selectRow(keep)
+            kind, text = self.status(m, cfg)
+            tiles.append(Tile(self, m, cfg, kind, text))
+        tiles.append(NewTile(self.new))
+        self.grid.set_tiles(tiles)
 
     # ---- CRUD
     def new(self):
@@ -510,9 +705,9 @@ class MainWindow(QMainWindow):
             return meta
         self.run(job, lambda _: self.refresh(), title="Tworzę profil…")
 
-    def edit(self):
-        meta = self.selected()
-        if not meta or self.active(meta["id"]):
+    def edit(self, pid: str):
+        meta = core.load_meta(pid)
+        if not meta or self.active(pid):
             return
         if core.merged_config(meta)["engine"] != "chrome":
             return QMessageBox.information(self, "Profile Manager", LEGACY_MSG)
@@ -520,7 +715,6 @@ class MainWindow(QMainWindow):
         if not d.exec():
             return
         name, cfg, regen = d.result_config()
-        pid = meta["id"]
         def job(pr):
             if regen:                                   # nowy seed = nowy fingerprint (trafia do configu i na serwer)
                 cfg["fp_seed"] = random.randint(100000, 2**31 - 1)
@@ -532,16 +726,16 @@ class MainWindow(QMainWindow):
             core.update_meta(pid, name=name, config=cfg)
         self.run(job, lambda _: self.refresh(), title="Zapisuję…")
 
-    def delete(self):
-        meta = self.selected()
-        if not meta or self.active(meta["id"]):
+    def delete(self, pid: str):
+        meta = core.load_meta(pid)
+        if not meta or self.active(pid):
             return
         if QMessageBox.question(self, "Usuń", f"Usunąć profil „{meta['name']}” lokalnie i na serwerze?\nTego nie da się cofnąć.") != QMessageBox.Yes:
             return
         def job(_):
-            if meta["id"] in self.server and self.has_token():
-                self.api.delete_profile(meta["id"])
-            core.delete_local(meta["id"])
+            if pid in self.server and self.has_token():
+                self.api.delete_profile(pid)
+            core.delete_local(pid)
         self.run(job, lambda _: self.refresh())
 
     def open_addons(self): AddonsDialog(self).exec()
@@ -552,11 +746,11 @@ class MainWindow(QMainWindow):
         SecurityDialog(self, self.api).exec() if self.has_token() else self.login()
 
     # ---- uruchamianie
-    def launch(self):
-        meta = self.selected()
+    def launch(self, pid: str):
+        meta = core.load_meta(pid)
         if not meta:
             return
-        pid, cfg = meta["id"], core.merged_config(meta)
+        cfg = core.merged_config(meta)
         if pid in self.running or pid in self.busy:
             return
         local_mode = pid in self.uploading or pid in self.pending or pid in self.next_snap
@@ -578,13 +772,31 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Uwaga", warn)
             cmd = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve().parent.parent / "main.py")]
             log = open(core.LOGS / f"{pid}.log", "ab")
-            proc = subprocess.Popen(cmd + ["--worker", pid], stdout=log, stderr=log,
-                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform.startswith("win") \
+                else {"start_new_session": True}       # własna grupa procesów, żeby Force stop zabił też przeglądarkę
+            proc = subprocess.Popen(cmd + ["--worker", pid], stdout=log, stderr=log, **kw)
             self.running[pid] = {"proc": proc, "last_hb": time.time(), "t0": time.time()}
             self.fill()
         def bad(e):
             self.busy.discard(pid); self.fill(); self.fail(e); self.refresh()
         self.run(job, ok, bad, title="Przygotowuję profil…")
+
+    def force_stop(self, pid: str):
+        r = self.running.get(pid)
+        if not r:
+            return
+        name = (core.load_meta(pid) or {}).get("name", pid)
+        if QMessageBox.question(
+                self, "Force stop",
+                f"Wymusić zatrzymanie profilu „{name}”?\n\n"
+                "Przeglądarka zostanie zabita bez normalnego zamykania, więc ostatnie zmiany "
+                "(np. świeżo zapisane cookies) mogą przepaść. Profil w ostatnim stanie zostanie "
+                "zsynchronizowany z serwerem, a blokada zwolniona.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        r["forced"] = True
+        kill_tree(r["proc"])
+        self.statusBar().showMessage(f"Wymuszono zatrzymanie profilu „{name}”.")
 
     def tick(self):
         now = time.time()
@@ -592,7 +804,7 @@ class MainWindow(QMainWindow):
             rc = r["proc"].poll()
             if rc is not None:
                 del self.running[pid]
-                if rc != 0:
+                if rc != 0 and not r.get("forced"):
                     QTimer.singleShot(0, lambda p=pid: self.show_crash(p))
                 self.session_ended(pid)
             elif now - r["last_hb"] > 30:
@@ -663,18 +875,14 @@ class MainWindow(QMainWindow):
                 if f: f.unlink(missing_ok=True)
             self.pending[pid] = err_text(e)
             self.fill()
-            self.statusBar().showMessage("Nie udało się wysłać profilu. „Synchronizuj teraz” ponowi wysyłkę.")
+            self.statusBar().showMessage("Nie udało się wysłać profilu. „Synchronizuj” ponowi wysyłkę.")
         self.run(lambda pr: sync.upload_snapshot(self.api, pid, arc, pr), ok, bad, modal=False)
 
     def after_sync(self, pid):
         self.statusBar().showMessage("Profil zsynchronizowany.")
         self.refresh()
 
-    def sync_now(self):
-        meta = self.selected()
-        if not meta:
-            return
-        pid = meta["id"]
+    def sync_now(self, pid: str):
         if pid in self.pending and pid not in self.running and pid not in self.busy:
             self.snapshot_and_enqueue(pid)
         else:
@@ -682,7 +890,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         if any(self.active(p) for p in list(self.running) + list(self.busy) + list(self.uploading) + list(self.pending)):
-            QMessageBox.warning(self, "Profile Manager", "Zamknij najpierw przeglądarki i poczekaj na zakończenie synchronizacji.")
+            QMessageBox.warning(self, "Profile Manager",
+                                "Zamknij najpierw przeglądarki (albo użyj Force stop) i poczekaj na zakończenie synchronizacji.")
             ev.ignore()
         else:
             ev.accept()
@@ -690,6 +899,8 @@ class MainWindow(QMainWindow):
 
 def run():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLE)
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

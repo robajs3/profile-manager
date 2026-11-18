@@ -39,6 +39,11 @@ Dane lokalne: `%APPDATA%\ProfileManager\` (profile, rozszerzenia, logi przegląd
 W „Rozszerzenia" biblioteka jest początkowo pusta (nic nie jest preinstalowane). Rozszerzenia dodajesz po ID/linku z Chrome Web Store
 albo z pliku (.crx/.zip) lub rozpakowanego folderu, a przypisujesz je do profili w „Edytuj". Brakujące rozszerzenia doinstalują się same na drugim komputerze.
 
+## Interfejs
+Profile są wyświetlane jako kafelki. Każdy kafelek ma własne przyciski: **Start**, **Force stop** (aktywny tylko, gdy profil działa; zabija przeglądarkę
+razem z całym drzewem procesów, po czym ostatni stan profilu jest synchronizowany i blokada zwalniana), **Edytuj**, **Usuń** oraz **Synchronizuj**
+(gdy wysyłka się nie udała). Dwuklik na kafelku też uruchamia profil. Na dole okna widać status połączenia i wersję aplikacji (`pm/__init__.py`).
+
 ## Strona startowa i zakładki
 - **Strona startowa** może być wpisana bez `https://` (np. `example.com`); adresy lokalne (`localhost`, IP) dostają `http://`.
   Jeśli strona się nie załaduje (brak sieci, zły proxy), przeglądarka zostaje otwarta i pokazuje stronę błędu.
